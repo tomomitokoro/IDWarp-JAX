@@ -1,16 +1,17 @@
 """Public array-based interface for JAX mesh deformation.
 
-This module contains no OpenFOAM, file-system, command-line, or NumPy I/O
-logic. The caller prepares the mesh arrays and supplies a displacement of the
-original surface nodes. :func:`deform_mesh` then performs the complete JAX
+This module contains no OpenFOAM, file-system, or command-line logic. The
+caller prepares the mesh arrays and supplies a displacement of the original
+surface nodes. :func:`deform_mesh` then performs the complete JAX
 mesh-deformation calculation:
 
 1. construct the target surface coordinates,
 2. constrain surface nodes originally on a symmetry plane when requested,
 3. compute original and deformed surface normals,
 4. compute local rotation matrices and translation vectors,
-5. call the unified volume-warp interface, and
-6. overwrite prescribed surface-boundary coordinates exactly.
+5. warp only volume points that are not prescribed surface points, and
+6. insert the warped non-surface points and prescribed surface coordinates into the
+   full volume-coordinate array.
 
 The returned value remains a JAX array. Synchronization, conversion to NumPy,
 and any mesh-file output are responsibilities of the calling application.
@@ -20,6 +21,10 @@ configuration arguments and returns the one-input mapping expected by the
 generic utilities in ``derivative.py``::
 
     surface_displacement -> deformed volume coordinates
+
+``make_deformation_function`` also builds the fixed non-surface volume-point
+index array once with NumPy and captures the resulting JAX index array for
+reuse by every deformation, JVP, and VJP evaluation.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 import normal
 import rotation
@@ -41,6 +47,148 @@ from symmetry import (
 Array = jax.Array
 
 __all__ = ["deform_mesh", "make_deformation_function"]
+
+
+def _make_warp_global_ids(
+    n_volume: int,
+    surface_global_ids,
+) -> Array:
+    """Return fixed global IDs for volume points outside the prescribed surface.
+
+    NumPy is used only for this one-time topology operation. The resulting
+    integer index array is converted back to a JAX array and can then be reused
+    by GPU-resident deformation calculations.
+    """
+    surface_ids_np = np.asarray(
+        jax.device_get(surface_global_ids),
+        dtype=np.int64,
+    ).reshape(-1)
+
+    if np.any(surface_ids_np < 0) or np.any(surface_ids_np >= n_volume):
+        raise ValueError(
+            "surface_global_ids contains an index outside the volume mesh"
+        )
+
+    if np.unique(surface_ids_np).size != surface_ids_np.size:
+        raise ValueError("surface_global_ids must not contain duplicates")
+
+    surface_mask = np.zeros(n_volume, dtype=bool)
+    surface_mask[surface_ids_np] = True
+
+    warp_global_ids_np = np.flatnonzero(~surface_mask).astype(
+        np.int32,
+        copy=False,
+    )
+
+    return jnp.asarray(warp_global_ids_np, dtype=jnp.int32)
+
+
+def _deform_mesh_with_warp_ids(
+    Xv0: Array,
+    Xs0: Array,
+    surface_displacement: Array,
+    conn: Array,
+    face_sizes: Array,
+    surface_global_ids: Array,
+    warp_global_ids: Array,
+    *,
+    Ldef: float,
+    aExp: float,
+    bExp: float,
+    alpha: float,
+    normal_eps: float,
+    rotation_eps: float,
+    warp_eps: float,
+    volume_chunk_size: int,
+    surface_block_size: int,
+    symmetry_mode: str,
+    symmetry_plane_point,
+    symmetry_plane_normal,
+    symmetry_tolerance: float,
+    symmetry_length_scale: float | None,
+) -> Array:
+    """Deform a mesh using a precomputed set of non-surface volume IDs."""
+    mode = symmetry.normalize_symmetry_mode(symmetry_mode)
+
+    # Construct the requested deformed surface.
+    Xs_unconstrained = Xs0 + surface_displacement
+
+    # Surface nodes that belonged to a symmetry plane in the reference mesh
+    # remain on that plane. Keeping this operation inside the differentiable
+    # mapping ensures that JVP/VJP includes the surface constraint.
+    if mode == SYMMETRY_NONE:
+        Xs = Xs_unconstrained
+        plane_point = None
+        plane_normal = None
+    else:
+        plane_point = jnp.asarray(
+            symmetry_plane_point,
+            dtype=Xv0.dtype,
+        )
+        plane_normal = jnp.asarray(
+            symmetry_plane_normal,
+            dtype=Xv0.dtype,
+        )
+
+        Xs = symmetry.constrain_points_originally_on_plane(
+            original_points=Xs0,
+            target_points=Xs_unconstrained,
+            plane_point=plane_point,
+            plane_normal=plane_normal,
+            tolerance=symmetry_tolerance,
+            eps=warp_eps,
+        )
+
+    # These reference quantities are still calculated for each deformation.
+    # Their precomputation and reuse will be handled separately.
+    normals0, Ai = normal.compute_node_normals(
+        Xs0,
+        conn,
+        face_sizes,
+        eps=normal_eps,
+    )
+
+    normals, _ = normal.compute_node_normals(
+        Xs,
+        conn,
+        face_sizes,
+        eps=normal_eps,
+    )
+
+    M, b = rotation.get_MB_rotation(
+        Xs0,
+        Xs,
+        normals0,
+        normals,
+        eps=rotation_eps,
+    )
+
+    # Only points outside the prescribed surface enter the expensive IDW
+    # calculation. Prescribed surface points are inserted exactly afterward.
+    Xv_non_surface = warp.deformed_volume_points(
+        Xv0=Xv0[warp_global_ids],
+        Xs0=Xs0,
+        Ai=Ai,
+        M=M,
+        b=b,
+        Ldef=Ldef,
+        aExp=aExp,
+        bExp=bExp,
+        alpha=alpha,
+        eps=warp_eps,
+        volume_chunk_size=volume_chunk_size,
+        surface_block_size=surface_block_size,
+        symmetry_mode=mode,
+        symmetry_plane_point=plane_point,
+        symmetry_plane_normal=plane_normal,
+        symmetry_length_scale=symmetry_length_scale,
+    )
+
+    # Reconstruct the full volume array. The two index sets are disjoint:
+    # warp_global_ids receives the IDW result and surface_global_ids receives
+    # the prescribed surface coordinates exactly.
+    Xv = Xv0.at[warp_global_ids].set(Xv_non_surface)
+    return Xv.at[surface_global_ids].set(Xs)
 
 
 def deform_mesh(
@@ -68,38 +216,9 @@ def deform_mesh(
 ) -> Array:
     """Deform a volume mesh from prescribed surface-node displacements.
 
-    Parameters
-    ----------
-    Xv0:                    Original volume coordinates with shape ``(n_volume, 3)``.
-    Xs0:                    Original surface coordinates with shape ``(n_surface, 3)``.
-    surface_displacement:   Displacement measured from ``Xs0``, with shape ``(n_surface, 3)``.
-    conn:                   Flattened local surface-face connectivity.
-    face_sizes:             Number of nodes in each surface face.
-    surface_global_ids:     Mapping from each local surface-node index to its corresponding volume-mesh point index.
-    Ldef:                   Reference length used by the IDW weights.
-    aExp, bExp, alpha:      IDW weighting parameters.
-    normal_eps:             Numerical regularization used by surface-normal calculations.
-    rotation_eps:           Numerical tolerance used by local rotation calculations.
-    warp_eps:               Numerical regularization used by the warp and symmetry geometry.
-    volume_chunk_size:      Number of volume points handled by each Python-level warp chunk.
-    surface_block_size:     Number of surface points handled by each compiled warp block.
-    symmetry_mode:          One of ``"nonesym"``, ``"exactsym"``, or ``"approxsym"``.
-    symmetry_plane_point:   Definition of the symmetry plane. Both point and normal are required by exact and approximate symmetry modes.
-    symmetry_plane_normal:  Definition of the symmetry plane. Both point and normal are required by exact and approximate symmetry modes.
-    symmetry_tolerance:     Distance tolerance used to identify surface points that were originally on the symmetry plane.
-    symmetry_length_scale:  Recovery distance for approximate symmetry. Required when ``symmetry_mode="approxsym"``.
-
-    Returns
-    -------
-    Array
-        Deformed volume coordinates with shape ``(n_volume, 3)``.
-
-    Notes
-    -----
-    The caller is responsible for supplying corresponding arrays, consistent
-    floating-point dtypes, and valid fixed-topology connectivity. The function
-    intentionally does not call ``block_until_ready`` or ``jax.device_get`` so
-    that it remains composable with JAX transformations such as JVP and VJP.
+    The public signature remains unchanged. Prescribed surface volume points are
+    excluded from the IDW calculation and are assigned the prescribed target
+    surface coordinates exactly.
     """
     mode = symmetry.normalize_symmetry_mode(symmetry_mode)
 
@@ -140,79 +259,37 @@ def deform_mesh(
         dtype=jnp.int32,
     )
 
-    # Construct the requested deformed surface.
-    Xs_unconstrained = Xs0 + surface_displacement
-
-    # Surface nodes that belonged to a symmetry plane in the reference mesh
-    # remain on that plane. Keeping this operation inside the public mapping
-    # ensures that JVP/VJP includes the surface constraint.
-    if mode == SYMMETRY_NONE:
-        Xs = Xs_unconstrained
-        plane_point = None
-        plane_normal = None
-    else:
-        plane_point = jnp.asarray(
-            symmetry_plane_point,
-            dtype=Xv0.dtype,
-        )
-        plane_normal = jnp.asarray(
-            symmetry_plane_normal,
-            dtype=Xv0.dtype,
-        )
-
-        Xs = symmetry.constrain_points_originally_on_plane(
-            original_points=Xs0,
-            target_points=Xs_unconstrained,
-            plane_point=plane_point,
-            plane_normal=plane_normal,
-            tolerance=symmetry_tolerance,
-            eps=warp_eps,
-        )
-
-    normals0, Ai = normal.compute_node_normals(
-        Xs0,
-        conn,
-        face_sizes,
-        eps=normal_eps,
+    # A direct deform_mesh call has no persistent closure, so its fixed index
+    # array is prepared for that call. Repeated applications should use
+    # make_deformation_function, which computes and stores this array once.
+    warp_global_ids = _make_warp_global_ids(
+        Xv0.shape[0],
+        surface_global_ids,
     )
 
-    normals, _ = normal.compute_node_normals(
-        Xs,
-        conn,
-        face_sizes,
-        eps=normal_eps,
-    )
-
-    M, b = rotation.get_MB_rotation(
-        Xs0,
-        Xs,
-        normals0,
-        normals,
-        eps=rotation_eps,
-    )
-
-    Xv = warp.deformed_volume_points(
+    return _deform_mesh_with_warp_ids(
         Xv0=Xv0,
         Xs0=Xs0,
-        Ai=Ai,
-        M=M,
-        b=b,
+        surface_displacement=surface_displacement,
+        conn=conn,
+        face_sizes=face_sizes,
+        surface_global_ids=surface_global_ids,
+        warp_global_ids=warp_global_ids,
         Ldef=Ldef,
         aExp=aExp,
         bExp=bExp,
         alpha=alpha,
-        eps=warp_eps,
+        normal_eps=normal_eps,
+        rotation_eps=rotation_eps,
+        warp_eps=warp_eps,
         volume_chunk_size=volume_chunk_size,
         surface_block_size=surface_block_size,
         symmetry_mode=mode,
-        symmetry_plane_point=plane_point,
-        symmetry_plane_normal=plane_normal,
+        symmetry_plane_point=symmetry_plane_point,
+        symmetry_plane_normal=symmetry_plane_normal,
+        symmetry_tolerance=symmetry_tolerance,
         symmetry_length_scale=symmetry_length_scale,
     )
-
-    # The prescribed surface is an exact boundary condition rather than an
-    # IDW approximation. This indexed update is differentiable in JAX.
-    return Xv.at[surface_global_ids].set(Xs)
 
 
 def make_deformation_function(
@@ -239,24 +316,79 @@ def make_deformation_function(
 ) -> Callable[[Array], Array]:
     """Create a one-input mesh-deformation function for JAX transforms.
 
-    The returned function has the signature::
-
-        deformation_function(surface_displacement) -> Xv
-
-    Mesh arrays and configuration values are captured without performing a
-    deformation. The actual calculation occurs only when the returned function
-    is called, including when it is passed to ``jax.jvp`` or ``jax.vjp`` through
-    the generic utilities in ``derivative.py``.
+    The fixed set of non-surface volume-point IDs is constructed once with NumPy,
+    converted to a JAX integer array, and captured in the returned function.
+    Subsequent deformation, JVP, and VJP evaluations reuse the same index array.
     """
+    mode = symmetry.normalize_symmetry_mode(symmetry_mode)
+
+    if volume_chunk_size <= 0:
+        raise ValueError("volume_chunk_size must be positive")
+    if surface_block_size <= 0:
+        raise ValueError("surface_block_size must be positive")
+
+    if mode != SYMMETRY_NONE:
+        if symmetry_plane_point is None or symmetry_plane_normal is None:
+            raise ValueError(
+                "symmetry_plane_point and symmetry_plane_normal are required "
+                "for exact and approximate symmetry modes"
+            )
+
+    if mode == SYMMETRY_APPROXIMATE:
+        if symmetry_length_scale is None:
+            raise ValueError(
+                "symmetry_length_scale is required for 'approxsym'"
+            )
+        if symmetry_length_scale <= 0.0:
+            raise ValueError(
+                "symmetry_length_scale must be positive for 'approxsym'"
+            )
+
+    # Convert and capture all fixed arrays before constructing the one-input
+    # differentiable mapping.
+    Xv0 = jnp.asarray(Xv0)
+    Xs0 = jnp.asarray(Xs0, dtype=Xv0.dtype)
+    conn = jnp.asarray(conn, dtype=jnp.int32)
+    face_sizes = jnp.asarray(face_sizes, dtype=jnp.int32)
+    surface_global_ids = jnp.asarray(
+        surface_global_ids,
+        dtype=jnp.int32,
+    )
+
+    if mode == SYMMETRY_NONE:
+        plane_point = None
+        plane_normal = None
+    else:
+        plane_point = jnp.asarray(
+            symmetry_plane_point,
+            dtype=Xv0.dtype,
+        )
+        plane_normal = jnp.asarray(
+            symmetry_plane_normal,
+            dtype=Xv0.dtype,
+        )
+
+    # Fixed topology operation: compute once on the CPU with NumPy, then retain
+    # the JAX index array in the closure for all later GPU computations.
+    warp_global_ids = _make_warp_global_ids(
+        Xv0.shape[0],
+        surface_global_ids,
+    )
 
     def deformation_function(surface_displacement: Array) -> Array:
-        return deform_mesh(
+        surface_displacement_jax = jnp.asarray(
+            surface_displacement,
+            dtype=Xv0.dtype,
+        )
+
+        return _deform_mesh_with_warp_ids(
             Xv0=Xv0,
             Xs0=Xs0,
-            surface_displacement=surface_displacement,
+            surface_displacement=surface_displacement_jax,
             conn=conn,
             face_sizes=face_sizes,
             surface_global_ids=surface_global_ids,
+            warp_global_ids=warp_global_ids,
             Ldef=Ldef,
             aExp=aExp,
             bExp=bExp,
@@ -266,9 +398,9 @@ def make_deformation_function(
             warp_eps=warp_eps,
             volume_chunk_size=volume_chunk_size,
             surface_block_size=surface_block_size,
-            symmetry_mode=symmetry_mode,
-            symmetry_plane_point=symmetry_plane_point,
-            symmetry_plane_normal=symmetry_plane_normal,
+            symmetry_mode=mode,
+            symmetry_plane_point=plane_point,
+            symmetry_plane_normal=plane_normal,
             symmetry_tolerance=symmetry_tolerance,
             symmetry_length_scale=symmetry_length_scale,
         )
