@@ -30,6 +30,8 @@ This project is an independent JAX implementation and is not part of the origina
 ```text
 .
 ├── driver.py
+├── deformation_core.py
+├── deformation_preparation.py
 ├── derivative.py
 ├── normal.py
 ├── rotation.py
@@ -47,6 +49,27 @@ The main functions are:
 * `deform_mesh(...)`
 * `make_deformation_function(...)`
 
+### `deformation_preparation.py`
+
+Prepares fixed mesh and reference-geometry data that can be reused across
+multiple deformation evaluations.
+
+Prepared data includes:
+* non-surface volume-point indices,
+* reusable surface-normal topology,
+* original surface normals,
+* original nodal area weights, and
+* the symmetry-plane surface mask when symmetry is enabled.
+
+### `deformation_core.py`
+
+Contains the deformation-dependent calculation performed for each new surface
+displacement.
+
+It constructs the target surface, applies symmetry-plane constraints, computes
+the deformed surface normals and local transformations, performs the IDW
+volume deformation, and reconstructs the complete volume-coordinate array.
+
 ### `warp.py`
 
 Contains the IDW volume-mesh deformation algorithms.
@@ -60,6 +83,8 @@ It supports three symmetry modes:
 ### `normal.py`
 
 Computes surface-node normals and nodal area weights from surface-face connectivity.
+
+It also prepares reusable topology indices so that coordinate-independent connectivity processing does not need to be repeated for each deformation.
 
 ### `rotation.py`
 
@@ -139,13 +164,17 @@ The public interface does not perform file I/O or OpenFOAM-specific processing.
 from driver import make_deformation_function
 ```
 
-`make_deformation_function(...)` fixes the mesh arrays and configuration values and returns a one-input function:
+`make_deformation_function(...)` prepares and captures the fixed mesh arrays,
+reference geometry, topology indices, and configuration values, then returns
+a one-input function:
 
 ```text
 surface_displacement -> deformed volume coordinates
 ```
 
-This form is intended for repeated deformation evaluations and JAX transformations such as JVP and VJP.
+The prepared data is reused across subsequent deformation evaluations. This
+form is intended for repeated calculations and JAX transformations such as
+JVP and VJP.
 
 ## Minimal Example
 
@@ -402,7 +431,8 @@ Current status:
 * JVP and VJP utilities: implemented but not fully validated
 * derivative consistency checks: implemented but not fully validated
 
-The initial public version prioritizes a clear array-based interface and separation of the mesh-deformation components. Future revisions may improve performance, reusable preprocessing, testing, examples, and documentation.
+Future revisions may improve performance, testing, examples, validation, and
+documentation.
 
 
 ## References
