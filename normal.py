@@ -1,212 +1,186 @@
-"""Surface-normal and nodal-area calculations for JAX mesh deformation.
+"""Surface-node normal calculations with reusable fixed topology.
 
-This module computes unit normals and area weights at surface mesh nodes from
-polygonal face connectivity. All numerical operations use JAX and remain
-compatible with JAX transformations and automatic differentiation.
-
-The surface topology is represented by:
-
-``pts``         Surface-node coordinates with shape ``(n_surface, 3)``.
-``conn``        Flattened face connectivity. The node indices for all faces are stored consecutively in a one-dimensional array.
-``faceSizes``   Number of nodes in each face. Together with ``conn``, this defines the start and end positions of every face.
+The surface connectivity does not change during deformation.  This module
+therefore separates one-time topology preparation from coordinate-dependent
+normal and area calculations.
 """
+
+from __future__ import annotations
+
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 
+Array = jax.Array
 
-def create_face_pointer(faceSizes):
-    """Construct offsets into flattened face connectivity.
+
+class NormalTopology(NamedTuple):
+    """Fixed indexing arrays used by the surface-normal calculation."""
+
+    face_ptr: Array
+    corner_ids: Array
+    face_ids: Array
+    face_start: Array
+    face_end: Array
+    next_corner_ids: Array
+    node_ids: Array
+    next_node_ids: Array
+    face_sizes: Array
+
+
+def create_face_pointer(face_sizes) -> Array:
+    """Return the flattened-connectivity pointer for each face."""
+    face_sizes = jnp.asarray(face_sizes, dtype=jnp.int32)
+    return jnp.concatenate(
+        (
+            jnp.zeros((1,), dtype=jnp.int32),
+            jnp.cumsum(face_sizes, dtype=jnp.int32),
+        )
+    )
+
+
+# Backward-compatible alias used by older code.
+create_face_pointer.__name__ = "create_face_pointer"
+
+
+def prepare_normal_topology(conn, face_sizes) -> NormalTopology:
+    """Prepare all coordinate-independent normal-calculation indices once.
 
     Parameters
     ----------
-    faceSizes: Number of nodes in each surface face, with shape ``(n_faces,)``.
-
-    Returns
-    -------
-    facePtr
-        Connectivity offsets with shape ``(n_faces + 1,)``. The connectivity entries for face ``i`` are stored in::
-        conn[facePtr[i] : facePtr[i + 1]]
-
-    Examples
-    --------
-    For ``faceSizes = [3, 4, 5]``, the returned pointer is ``[0, 3, 7, 12]``.
+    conn
+        Flattened local surface-face connectivity.
+    face_sizes
+        Number of nodes in each surface face.
     """
-    faceSizes = jnp.asarray(faceSizes, dtype=jnp.int32)
+    conn = jnp.asarray(conn, dtype=jnp.int32)
+    face_sizes = jnp.asarray(face_sizes, dtype=jnp.int32)
 
-    facePtr = jnp.concatenate(
-        [
-            jnp.array([0], dtype=jnp.int32),
-            jnp.cumsum(faceSizes),
-        ]
+    n_conn = conn.shape[0]
+    face_ptr = create_face_pointer(face_sizes)
+    corner_ids = jnp.arange(n_conn, dtype=jnp.int32)
+    face_ids = jnp.searchsorted(
+        face_ptr[1:],
+        corner_ids,
+        side="right",
     )
 
-    return facePtr
+    face_start = face_ptr[face_ids]
+    face_end = face_ptr[face_ids + 1]
+    next_corner_ids = jnp.where(
+        corner_ids + 1 < face_end,
+        corner_ids + 1,
+        face_start,
+    )
+
+    node_ids = conn
+    next_node_ids = conn[next_corner_ids]
+
+    return NormalTopology(
+        face_ptr=face_ptr,
+        corner_ids=corner_ids,
+        face_ids=face_ids,
+        face_start=face_start,
+        face_end=face_end,
+        next_corner_ids=next_corner_ids,
+        node_ids=node_ids,
+        next_node_ids=next_node_ids,
+        face_sizes=face_sizes,
+    )
+
 
 @jax.jit
+def compute_node_normals_from_topology(
+    pts,
+    topology: NormalTopology,
+    eps: float = 1.0e-30,
+):
+    """Compute nodal normals and area weights using prepared topology."""
+    pts = jnp.asarray(pts)
+
+    n_surface = pts.shape[0]
+    n_face = topology.face_sizes.shape[0]
+
+    x0 = pts[topology.node_ids]
+    x1 = pts[topology.next_node_ids]
+
+    edge_cross = jnp.cross(x0, x1)
+    raw_face_normal = jax.ops.segment_sum(
+        edge_cross,
+        topology.face_ids,
+        num_segments=n_face,
+    )
+
+    raw_norm = jnp.sqrt(
+        jnp.sum(raw_face_normal * raw_face_normal, axis=1) + eps
+    )
+    face_area = 0.5 * raw_norm
+    face_normal = raw_face_normal / raw_norm[:, None]
+
+    corners_per_face = topology.face_sizes.astype(pts.dtype)
+    valid_face = topology.face_sizes >= 3
+    area_per_corner = jnp.where(
+        valid_face,
+        face_area / corners_per_face,
+        0.0,
+    )
+
+    corner_area = area_per_corner[topology.face_ids]
+    corner_face_normal = face_normal[topology.face_ids]
+    corner_normal_contribution = (
+        corner_area[:, None] * corner_face_normal
+    )
+
+    normal_sum = jnp.zeros((n_surface, 3), dtype=pts.dtype)
+    area_sum = jnp.zeros((n_surface,), dtype=pts.dtype)
+    normal_sum = normal_sum.at[topology.node_ids].add(
+        corner_normal_contribution
+    )
+    area_sum = area_sum.at[topology.node_ids].add(corner_area)
+
+    normals = normal_sum / (area_sum[:, None] + eps)
+    normal_norm = jnp.sqrt(
+        jnp.sum(normals * normals, axis=1, keepdims=True) + eps
+    )
+    normals = normals / normal_norm
+
+    return normals, area_sum
+
+
 def compute_node_normals(
     pts,
     conn,
     faceSizes,
-    eps=1e-30,
+    eps: float = 1.0e-30,
 ):
-    """Compute unit node normals and nodal area weights.
-    Face normals are computed from the ordered polygon vertices using
-    ``N_f = sum_k (x_k cross x_{k+1})``.
+    """Backward-compatible self-contained normal calculation.
 
-        The corresponding face area is
-    ``A_f = 0.5 * ||N_f||``.
-
-    Each face contributes an equal fraction of its area to each of its corner
-    nodes. Node normals are formed by averaging the adjacent unit face normals
-    using these area contributions as weights, then normalizing the result.
-
-    Parameters
-    ----------
-    pts:        Surface-node coordinates with shape ``(n_surface, 3)``.
-    conn:       Flattened local face connectivity with shape ``(n_connectivity,)``.
-    faceSizes:  Number of nodes in each face, with shape ``(n_faces,)``.
-    eps:        Small positive regularization used in norms and divisions.
-
-    Returns
-    -------
-    normals: Unit normal vector at each surface node, with shape ``(n_surface, 3)``.
-    Ai:      Accumulated area weight at each surface node, with shape ``(n_surface,)``.
+    Repeated deformation calls should instead prepare topology once with
+    :func:`prepare_normal_topology` and call
+    :func:`compute_node_normals_from_topology`.
     """
-    pts = jnp.asarray(pts)
-    conn = jnp.asarray(conn, dtype=jnp.int32)
-    faceSizes = jnp.asarray(faceSizes, dtype=jnp.int32)
-    
-
-    nSurf = pts.shape[0]                
-    nFace = faceSizes.shape[0]          
-    nConn = conn.shape[0]               
-
-    # Build offsets into the flattened connectivity array.
-    facePtr = create_face_pointer(faceSizes) 
-
-    cornerIds = jnp.arange(nConn, dtype=jnp.int32)
-    faceIds = jnp.searchsorted(
-        facePtr[1:],
-        cornerIds,
-        side="right",
-    )
-    
-    # For every face corner, find the following corner in the same face.
-    # The final corner wraps back to the first corner of that face.
-    faceStart = facePtr[faceIds]
-    faceEnd = facePtr[faceIds + 1]
-    
-    nextCornerIds = jnp.where(
-        cornerIds + 1 < faceEnd,
-        cornerIds + 1,
-        faceStart,
-    )
-
-    # Current and next node indices for each directed polygon edge.
-    nodeIds = conn
-    nextNodeIds = conn[nextCornerIds]
-    
-    # Coordinates at the ends of each directed polygon edge.
-    x0 = pts[nodeIds]
-    x1 = pts[nextNodeIds]
-
-    # Each edge contributes x_k cross x_{k+1} to its face normal.
-    edgeCross = jnp.cross(x0, x1)
-
-    # Sum edge contributions separately for every face.
-    rawFaceNormal = jax.ops.segment_sum(
-        edgeCross,
-        faceIds,
-        num_segments=nFace,
-    )
-
-    # Compute face areas and unit face normals.
-    rawNorm = jnp.sqrt(
-        jnp.sum(rawFaceNormal * rawFaceNormal, axis=1) + eps
-    )
-
-    faceArea = 0.5 * rawNorm
-    faceNormal = rawFaceNormal / rawNorm[:, None]
-
-    # Divide each valid face area equally among its corner nodes.
-    c_f = faceSizes.astype(pts.dtype)
-
-    validFace = faceSizes >= 3
-
-    dA = jnp.where(
-        validFace,
-        faceArea / c_f,
-        0.0,
-    )
-
-    # Gather the area and unit-normal contribution for every face corner.
-    cornerDA = dA[faceIds]
-    cornerFaceNormal = faceNormal[faceIds]
-
-    cornerNormalContribution = cornerDA[:, None] * cornerFaceNormal
-
-    # Accumulate all adjacent-face contributions at each surface node.
-    normalSum = jnp.zeros((nSurf, 3), dtype=pts.dtype)
-    areaSum = jnp.zeros((nSurf,), dtype=pts.dtype)
-
-    normalSum = normalSum.at[nodeIds].add(cornerNormalContribution)
-    areaSum = areaSum.at[nodeIds].add(cornerDA)
-
-    # Form the area-weighted average normal at each node.
-    normals = normalSum / (areaSum[:, None] + eps)
-
-    # Normalize the averaged node normals to unit length.
-    normalNorm = jnp.sqrt(
-        jnp.sum(normals * normals, axis=1, keepdims=True) + eps
-    )
-
-    normals = normals / normalNorm
-
-    Ai = areaSum
-
-    return normals, Ai
+    topology = prepare_normal_topology(conn, faceSizes)
+    return compute_node_normals_from_topology(pts, topology, eps=eps)
 
 
-@jax.jit
 def get_normals_Ai(
     pts0,
     pts,
     conn,
     faceSizes,
-    eps=1e-30,
+    eps: float = 1.0e-30,
 ):
-    """Compute original and deformed node normals and original area weights.
-
-    Parameters
-    ----------
-    pts0        Original surface-node coordinates, equivalent to ``Xs0``, with shape ``(n_surface, 3)``.
-    pts         Deformed surface-node coordinates, equivalent to ``Xs``, with shape ``(n_surface, 3)``.
-    conn        Flattened local face connectivity.
-    faceSizes   Number of nodes in each face.
-    eps         Small positive regularization used by the normal calculations.
-
-    Returns
-    -------
-    normals0    Unit node normals of the original surface.
-    normals     Unit node normals of the deformed surface.
-    Ai          Node area weights computed from the original surface.
-    """    
-
-    normals0, Ai = compute_node_normals(
+    """Compute original/deformed normals and original area weights."""
+    topology = prepare_normal_topology(conn, faceSizes)
+    normals0, Ai = compute_node_normals_from_topology(
         pts0,
-        conn,
-        faceSizes,
-        eps,
+        topology,
+        eps=eps,
     )
-
-    normals, _ = compute_node_normals(
+    normals, _ = compute_node_normals_from_topology(
         pts,
-        conn,
-        faceSizes,
-        eps,
+        topology,
+        eps=eps,
     )
-
     return normals0, normals, Ai
-
-

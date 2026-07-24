@@ -22,9 +22,11 @@ generic utilities in ``derivative.py``::
 
     surface_displacement -> deformed volume coordinates
 
-``make_deformation_function`` also builds the fixed non-surface volume-point
-index array once with NumPy and captures the resulting JAX index array for
-reuse by every deformation, JVP, and VJP evaluation.
+``make_deformation_function`` also prepares the fixed non-surface volume-point
+index array, original surface normals, original area weights, reusable normal-topology
+indices, and the mask of surface points originally on the symmetry plane
+once. These reference
+values are captured and reused by every deformation, JVP, and VJP evaluation.
 """
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ def _make_warp_global_ids(
     n_volume: int,
     surface_global_ids,
 ) -> Array:
-    """Return fixed global IDs for volume points outside the prescribed surface.
+    """Return fixed global IDs for volume points outside the surface.
 
     NumPy is used only for this one-time topology operation. The resulting
     integer index array is converted back to a JAX array and can then be reused
@@ -91,6 +93,10 @@ def _deform_mesh_with_warp_ids(
     face_sizes: Array,
     surface_global_ids: Array,
     warp_global_ids: Array,
+    normals0: Array,
+    Ai: Array,
+    surface_on_plane: Array | None,
+    normal_topology: normal.NormalTopology,
     *,
     Ldef: float,
     aExp: float,
@@ -104,10 +110,9 @@ def _deform_mesh_with_warp_ids(
     symmetry_mode: str,
     symmetry_plane_point,
     symmetry_plane_normal,
-    symmetry_tolerance: float,
     symmetry_length_scale: float | None,
 ) -> Array:
-    """Deform a mesh using a precomputed set of non-surface volume IDs."""
+    """Deform a mesh using precomputed fixed reference data."""
     mode = symmetry.normalize_symmetry_mode(symmetry_mode)
 
     # Construct the requested deformed surface.
@@ -130,28 +135,23 @@ def _deform_mesh_with_warp_ids(
             dtype=Xv0.dtype,
         )
 
-        Xs = symmetry.constrain_points_originally_on_plane(
-            original_points=Xs0,
-            target_points=Xs_unconstrained,
-            plane_point=plane_point,
-            plane_normal=plane_normal,
-            tolerance=symmetry_tolerance,
+        projected_surface = symmetry.project_points_to_plane(
+            Xs_unconstrained,
+            plane_point,
+            plane_normal,
             eps=warp_eps,
         )
+        Xs = jnp.where(
+            surface_on_plane[:, None],
+            projected_surface,
+            Xs_unconstrained,
+        )
 
-    # These reference quantities are still calculated for each deformation.
-    # Their precomputation and reuse will be handled separately.
-    normals0, Ai = normal.compute_node_normals(
-        Xs0,
-        conn,
-        face_sizes,
-        eps=normal_eps,
-    )
-
-    normals, _ = normal.compute_node_normals(
+    # Original normals and area weights are fixed reference quantities.
+    # They are supplied by the caller and reused here without recomputation.
+    normals, _ = normal.compute_node_normals_from_topology(
         Xs,
-        conn,
-        face_sizes,
+        normal_topology,
         eps=normal_eps,
     )
 
@@ -163,8 +163,8 @@ def _deform_mesh_with_warp_ids(
         eps=rotation_eps,
     )
 
-    # Only points outside the prescribed surface enter the expensive IDW
-    # calculation. Prescribed surface points are inserted exactly afterward.
+    # Only points outside the prescribed surface enter the expensive IDW calculation. 
+    # Surface points are inserted exactly afterward.
     Xv_non_surface = warp.deformed_volume_points(
         Xv0=Xv0[warp_global_ids],
         Xs0=Xs0,
@@ -216,9 +216,8 @@ def deform_mesh(
 ) -> Array:
     """Deform a volume mesh from prescribed surface-node displacements.
 
-    The public signature remains unchanged. Prescribed surface volume points are
-    excluded from the IDW calculation and are assigned the prescribed target
-    surface coordinates exactly.
+    Prescribed surface points are excluded from the IDW calculation and assigned
+    the target surface coordinates exactly.
     """
     mode = symmetry.normalize_symmetry_mode(symmetry_mode)
 
@@ -267,6 +266,33 @@ def deform_mesh(
         surface_global_ids,
     )
 
+    # A direct call is self-contained, so fixed reference geometry is
+    # prepared once for this call. Repeated applications should use
+    # make_deformation_function(), which retains these arrays for reuse.
+    normal_topology = normal.prepare_normal_topology(
+        conn,
+        face_sizes,
+    )
+    normals0, Ai = normal.compute_node_normals_from_topology(
+        Xs0,
+        normal_topology,
+        eps=normal_eps,
+    )
+
+    # A direct call is also self-contained for symmetry geometry. The mask is
+    # fixed for this mesh and plane, but without a persistent closure it is
+    # prepared once for this call.
+    if mode == SYMMETRY_NONE:
+        surface_on_plane = None
+    else:
+        surface_on_plane = symmetry.points_on_plane(
+            Xs0,
+            symmetry_plane_point,
+            symmetry_plane_normal,
+            symmetry_tolerance,
+            eps=warp_eps,
+        )
+
     return _deform_mesh_with_warp_ids(
         Xv0=Xv0,
         Xs0=Xs0,
@@ -275,6 +301,10 @@ def deform_mesh(
         face_sizes=face_sizes,
         surface_global_ids=surface_global_ids,
         warp_global_ids=warp_global_ids,
+        normals0=normals0,
+        Ai=Ai,
+        surface_on_plane=surface_on_plane,
+        normal_topology=normal_topology,
         Ldef=Ldef,
         aExp=aExp,
         bExp=bExp,
@@ -287,7 +317,6 @@ def deform_mesh(
         symmetry_mode=mode,
         symmetry_plane_point=symmetry_plane_point,
         symmetry_plane_normal=symmetry_plane_normal,
-        symmetry_tolerance=symmetry_tolerance,
         symmetry_length_scale=symmetry_length_scale,
     )
 
@@ -316,9 +345,11 @@ def make_deformation_function(
 ) -> Callable[[Array], Array]:
     """Create a one-input mesh-deformation function for JAX transforms.
 
-    The fixed set of non-surface volume-point IDs is constructed once with NumPy,
-    converted to a JAX integer array, and captured in the returned function.
-    Subsequent deformation, JVP, and VJP evaluations reuse the same index array.
+    The fixed non-surface volume-point IDs, normal-topology indices, original
+    surface normals, original area weights, and symmetry-plane surface mask
+    are prepared once and
+    captured in the returned function. Subsequent deformation, JVP, and VJP
+    evaluations reuse these arrays.
     """
     mode = symmetry.normalize_symmetry_mode(symmetry_mode)
 
@@ -358,6 +389,7 @@ def make_deformation_function(
     if mode == SYMMETRY_NONE:
         plane_point = None
         plane_normal = None
+        surface_on_plane = None
     else:
         plane_point = jnp.asarray(
             symmetry_plane_point,
@@ -368,11 +400,33 @@ def make_deformation_function(
             dtype=Xv0.dtype,
         )
 
+        # Fixed reference-geometry operation: identify once which original
+        # Surface points belong to the symmetry plane.
+        surface_on_plane = symmetry.points_on_plane(
+            Xs0,
+            plane_point,
+            plane_normal,
+            symmetry_tolerance,
+            eps=warp_eps,
+        )
+
     # Fixed topology operation: compute once on the CPU with NumPy, then retain
     # the JAX index array in the closure for all later GPU computations.
     warp_global_ids = _make_warp_global_ids(
         Xv0.shape[0],
         surface_global_ids,
+    )
+
+    # Reference surface geometry depends only on Xs0 and fixed topology.
+    # Compute it once before constructing the differentiable one-input map.
+    normal_topology = normal.prepare_normal_topology(
+        conn,
+        face_sizes,
+    )
+    normals0, Ai = normal.compute_node_normals_from_topology(
+        Xs0,
+        normal_topology,
+        eps=normal_eps,
     )
 
     def deformation_function(surface_displacement: Array) -> Array:
@@ -389,6 +443,10 @@ def make_deformation_function(
             face_sizes=face_sizes,
             surface_global_ids=surface_global_ids,
             warp_global_ids=warp_global_ids,
+            normals0=normals0,
+            Ai=Ai,
+            surface_on_plane=surface_on_plane,
+            normal_topology=normal_topology,
             Ldef=Ldef,
             aExp=aExp,
             bExp=bExp,
@@ -401,7 +459,6 @@ def make_deformation_function(
             symmetry_mode=mode,
             symmetry_plane_point=plane_point,
             symmetry_plane_normal=plane_normal,
-            symmetry_tolerance=symmetry_tolerance,
             symmetry_length_scale=symmetry_length_scale,
         )
 
